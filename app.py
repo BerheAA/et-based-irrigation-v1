@@ -1,10 +1,10 @@
-
 import os
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
 import time
+import altair as alt
 from datetime import date, datetime, timedelta
 
 # -------------------------
@@ -152,6 +152,28 @@ IRRIGATION_SYSTEMS = {
     "Sprinkler (solid set/line)": 0.80,
     "Surface / Furrow": 0.65,
     "Drip": 0.90,
+}
+
+# Kansas / DSSAT-style automatic irrigation trigger used here for center
+# pivot/sprinkler scheduling in major cereal and legume crops:
+# apply a fixed event depth (commonly 25 mm) when the soil-water deficit
+# reaches 50% of the maximum available water in the management depth.
+# The management depth used here is the top 30 cm, matching the user's DSSAT
+# automatic-irrigation interpretation.
+MANAGEMENT_DEPTH_M = 0.30
+KANSAS_TRIGGER_FRACTION = 0.50
+
+CEREAL_AND_LEGUME_CROPS = {
+    "Corn (grain)",
+    "Corn (silage)",
+    "Grain sorghum",
+    "Soybean",
+    "Winter wheat",
+}
+
+SPRINKLER_PIVOT_SYSTEMS = {
+    "Center pivot",
+    "Sprinkler (solid set/line)",
 }
 
 # -------------------------
@@ -449,7 +471,7 @@ def get_openet_api_key():
     return key or os.getenv("OPENET_API_KEY", "")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_openet_actual_et(lat, lon, start_date, end_date, model="Ensemble", interval="daily"):
     """
     Retrieve OpenET satellite-based actual evapotranspiration for a point.
@@ -503,10 +525,18 @@ def fetch_openet_actual_et(lat, lon, start_date, end_date, model="Ensemble", int
     )
 
     if err is not None or data is None:
-        st.warning(f"Could not retrieve OpenET actual ET data: {err}")
+        # OpenET sometimes returns temporary 5xx server errors under load.
+        # Do not show a scary raw API error or stop the dashboard.
+        # Return an empty dataframe so apply_et_method() can use the safe Open-Meteo fallback.
         return empty
 
-    return parse_openet_timeseries(data, start_date, end_date)
+    parsed = parse_openet_timeseries(data, start_date, end_date)
+
+    # If OpenET responded but the structure was not usable, still fail safely.
+    if parsed is None or parsed.empty:
+        return empty
+
+    return parsed
 
 
 def parse_openet_timeseries(data, start_date, end_date):
@@ -561,7 +591,7 @@ def parse_openet_timeseries(data, start_date, end_date):
                 break
 
     if date_col is None or et_col is None:
-        st.warning(f"OpenET response columns were not recognized: {list(df.columns)}")
+        # Response format was not usable. Return empty and let the dashboard fallback safely.
         return empty
 
     out = df[[date_col, et_col]].copy()
@@ -639,9 +669,9 @@ def apply_et_method(df_weather, lat, lon, planting_date, season_length, crop_nam
 
     if not get_openet_api_key():
         st.info(
-            "OpenET was selected, but OPENET_API_KEY is not configured. "
-            "The app is safely using Open-Meteo ET0 x Kc. Add the key in .streamlit/secrets.toml "
-            "or Streamlit Cloud secrets to enable OpenET."
+            "OpenET is optional and is not enabled because no OPENET_API_KEY is configured. "
+            "The dashboard is running normally with Open-Meteo ET0 x Kc. "
+            "To enable OpenET, add OPENET_API_KEY in Streamlit Cloud secrets or in local .streamlit/secrets.toml."
         )
         df["et_source"] = "Open-Meteo fallback: OpenET API key missing"
         return df
@@ -656,7 +686,10 @@ def apply_et_method(df_weather, lat, lon, planting_date, season_length, crop_nam
     )
 
     if df_openet.empty:
-        st.info("OpenET returned no usable ET values. The app is safely using Open-Meteo ET0 x Kc instead.")
+        st.info(
+            "OpenET actual ET is temporarily unavailable or returned no usable values. "
+            "The dashboard is continuing normally with Open-Meteo ET0 x Kc fallback."
+        )
         df["et_source"] = "Open-Meteo fallback: OpenET unavailable"
         return df
 
@@ -733,17 +766,19 @@ def simulate_irrigation(
     crop_name,
     soil_name,
     strategy_label,
+    irrigation_system=None,
     irrigation_efficiency=0.85,
     rainfall_efficiency=0.8,
     irrigation_application_mm=25.0,
 ):
     """
-    Daily root-zone water balance for irrigation scheduling.
+    Daily water-balance irrigation scheduling.
 
-    Key correction:
-    - Sprinkler/center-pivot irrigation does NOT refill the full root zone in one event.
-    - Each irrigation event is limited to the selected gross application depth,
-      e.g., 25 mm/event for Kansas center-pivot or sprinkler irrigation.
+    Main operational correction:
+    - Center-pivot/sprinkler irrigation for cereal and legume crops is triggered
+      using the top 30 cm management depth, not the full crop root zone.
+    - The trigger is 50% depletion of the available water in that management depth.
+    - Each event applies the selected gross event depth, typically 25 mm.
     """
 
     if df_weather is None or df_weather.empty:
@@ -755,12 +790,37 @@ def simulate_irrigation(
     kc = crop["kc"]
     root_depth = crop["root_depth_m"]
     taw_per_m = soil["TAW_mm_per_m"]
+
+    # Full crop-root-zone TAW is retained for seasonal water-balance summaries.
     taw = taw_per_m * root_depth
 
-    # Strategy value is interpreted as allowable depletion fraction of TAW.
-    # Full irrigation = trigger earlier; severe deficit = trigger later.
-    allowable_depletion_fraction = STRATEGIES[strategy_label]
-    trigger_depletion_mm = taw * allowable_depletion_fraction
+    # Management-depth TAW controls automatic irrigation scheduling.
+    management_depth_m = MANAGEMENT_DEPTH_M
+    management_taw_mm = taw_per_m * management_depth_m
+
+    strategy_depletion_fraction = STRATEGIES[strategy_label]
+    use_kansas_50pct_trigger = (
+        irrigation_system in SPRINKLER_PIVOT_SYSTEMS
+        and crop_name in CEREAL_AND_LEGUME_CROPS
+    )
+
+    if use_kansas_50pct_trigger:
+        allowable_depletion_fraction = KANSAS_TRIGGER_FRACTION
+        trigger_rule = (
+            "Kansas/DSSAT-style 50% trigger: irrigate when deficit reaches "
+            "50% of available water in the top 30 cm management depth."
+        )
+    else:
+        allowable_depletion_fraction = strategy_depletion_fraction
+        trigger_rule = (
+            "Strategy-based trigger from selected irrigation strategy, calculated "
+            "over the top 30 cm management depth for scheduling."
+        )
+
+    trigger_depletion_mgmt_mm = management_taw_mm * allowable_depletion_fraction
+    trigger_storage_mgmt_mm = management_taw_mm - trigger_depletion_mgmt_mm
+    trigger_depletion_pct = allowable_depletion_fraction * 100.0
+    trigger_storage_pct = 100.0 - trigger_depletion_pct
 
     df = df_weather.copy()
     df["date"] = df["time"].dt.date
@@ -775,16 +835,25 @@ def simulate_irrigation(
     df["etc_mm"] = pd.to_numeric(df["etc_mm"], errors="coerce").fillna(0.0)
     df["eff_precip_mm"] = df["precip_mm"] * rainfall_efficiency
 
-    gross_event_depth = float(irrigation_application_mm)
-    gross_event_depth = max(0.0, gross_event_depth)
+    gross_event_depth = max(float(irrigation_application_mm), 0.0)
 
-    water_storage = taw
+    # Root-zone storage supports seasonal ET deficit summaries.
+    root_storage = taw
+
+    # Management-layer storage controls irrigation trigger and chart display.
+    management_storage = management_taw_mm
 
     irrigations = []
-    storage_list = []
-    deficit_list = []
+    root_storage_list = []
+    root_deficit_list = []
+    management_storage_list = []
+    management_deficit_list = []
+    management_storage_pct_list = []
+    management_deficit_pct_list = []
     actual_et_list = []
     et_deficit_list = []
+    irrigation_applied_list = []
+    effective_irrigation_applied_list = []
 
     etc_cum = 0.0
     actual_et_cum = 0.0
@@ -794,40 +863,58 @@ def simulate_irrigation(
         etc = max(float(row["etc_mm"]), 0.0)
         p_eff = max(float(row["eff_precip_mm"]), 0.0)
 
-        # Add effective rainfall first.
-        water_storage = min(taw, water_storage + p_eff)
+        # Rainfall enters both the full root zone and top 30 cm management layer.
+        root_storage = min(taw, root_storage + p_eff)
+        management_storage = min(management_taw_mm, management_storage + p_eff)
 
-        # Crop consumes water from the root zone.
-        actual_et = min(water_storage, etc)
-        water_storage = max(0.0, water_storage - actual_et)
+        # ET demand depletes both storages. The root-zone storage is used for
+        # seasonal ET-demand-met summaries; the management storage is used for
+        # automatic irrigation triggering and percent display.
+        actual_et = min(root_storage, etc)
+        root_storage = max(0.0, root_storage - actual_et)
+        management_storage = max(0.0, management_storage - etc)
 
         et_deficit = max(0.0, etc - actual_et)
 
-        deficit_before_irrigation = taw - water_storage
+        management_deficit_before_irrigation = management_taw_mm - management_storage
+        root_deficit_before_irrigation = taw - root_storage
         irrigation_mm = 0.0
+        irrigation_effective_mm = 0.0
 
-        # Trigger irrigation when depletion exceeds the selected threshold.
-        if deficit_before_irrigation >= trigger_depletion_mm and gross_event_depth > 0:
-            # Apply only the selected event depth, not the whole root-zone deficit.
-            # Example: sprinkler/center pivot = 25 mm/event.
-            max_gross_needed = deficit_before_irrigation / irrigation_efficiency
-            irrigation_mm = min(gross_event_depth, max_gross_needed)
-
+        # Trigger irrigation only after the management-depth deficit reaches
+        # the selected threshold. For Kansas pivot/sprinkler cereal/legume
+        # cases, this is exactly 50% of available water in the top 30 cm.
+        if management_deficit_before_irrigation >= trigger_depletion_mgmt_mm and gross_event_depth > 0:
+            irrigation_mm = gross_event_depth
             irrigation_effective_mm = irrigation_mm * irrigation_efficiency
-            water_storage = min(taw, water_storage + irrigation_effective_mm)
+
+            root_storage = min(taw, root_storage + irrigation_effective_mm)
+            management_storage = min(management_taw_mm, management_storage + irrigation_effective_mm)
 
             irrigations.append(
                 {
                     "date": row["date"],
                     "irrigation_mm": irrigation_mm,
                     "effective_irrigation_mm": irrigation_effective_mm,
-                    "deficit_before_mm": deficit_before_irrigation,
-                    "deficit_after_mm": taw - water_storage,
+                    "management_depth_m": management_depth_m,
+                    "deficit_before_pct": 100.0 * management_deficit_before_irrigation / management_taw_mm if management_taw_mm > 0 else 0.0,
+                    "deficit_after_pct": 100.0 * (management_taw_mm - management_storage) / management_taw_mm if management_taw_mm > 0 else 0.0,
+                    "storage_after_pct": 100.0 * management_storage / management_taw_mm if management_taw_mm > 0 else 0.0,
                 }
             )
 
-        storage_list.append(water_storage)
-        deficit_list.append(taw - water_storage)
+        root_storage_list.append(root_storage)
+        root_deficit_list.append(taw - root_storage)
+        management_storage_list.append(management_storage)
+        management_deficit_list.append(management_taw_mm - management_storage)
+        management_storage_pct_list.append(
+            100.0 * management_storage / management_taw_mm if management_taw_mm > 0 else 0.0
+        )
+        management_deficit_pct_list.append(
+            100.0 * (management_taw_mm - management_storage) / management_taw_mm if management_taw_mm > 0 else 0.0
+        )
+        irrigation_applied_list.append(irrigation_mm)
+        effective_irrigation_applied_list.append(irrigation_effective_mm)
         actual_et_list.append(actual_et)
         et_deficit_list.append(et_deficit)
 
@@ -835,8 +922,19 @@ def simulate_irrigation(
         actual_et_cum += actual_et
         et_deficit_cum += et_deficit
 
-    df["soil_storage_mm"] = storage_list
-    df["deficit_mm"] = deficit_list
+    df["irrigation_applied_mm"] = irrigation_applied_list
+    df["effective_irrigation_applied_mm"] = effective_irrigation_applied_list
+
+    # Root-zone values are retained for continuity and seasonal summaries.
+    df["soil_storage_mm"] = root_storage_list
+    df["deficit_mm"] = root_deficit_list
+
+    # Management-depth values drive the chart and automatic irrigation trigger.
+    df["management_storage_mm"] = management_storage_list
+    df["management_deficit_mm"] = management_deficit_list
+    df["management_storage_pct"] = management_storage_pct_list
+    df["management_deficit_pct"] = management_deficit_pct_list
+
     df["actual_et_mm"] = actual_et_list
     df["et_deficit_mm"] = et_deficit_list
 
@@ -862,7 +960,14 @@ def simulate_irrigation(
 
     summary = {
         "taw_mm": taw,
-        "trigger_depletion_mm": trigger_depletion_mm,
+        "management_depth_m": management_depth_m,
+        "management_taw_mm": management_taw_mm,
+        "trigger_depletion_mm": trigger_depletion_mgmt_mm,
+        "trigger_storage_mm": trigger_storage_mgmt_mm,
+        "trigger_depletion_fraction": allowable_depletion_fraction,
+        "trigger_depletion_pct": trigger_depletion_pct,
+        "trigger_storage_pct": trigger_storage_pct,
+        "trigger_rule": trigger_rule,
         "irrigation_application_mm": gross_event_depth,
         "total_etc_mm": etc_cum,
         "actual_et_mm": actual_et_cum,
@@ -1174,6 +1279,7 @@ if run_button:
                 crop_name,
                 soil_name,
                 strategy_label,
+                irrigation_system=irrigation_system,
                 irrigation_efficiency=irrigation_eff,
                 rainfall_efficiency=rainfall_eff,
                 irrigation_application_mm=irrigation_application_mm,
@@ -1284,7 +1390,12 @@ if run_button:
                         "Irrigation system": [irrigation_system],
                         "Strategy": [strategy_label],
                         "ET method": [et_method if climate_source == "Open-Meteo (automatic)" else climate_source],
-                        "TAW (mm)": [summary["taw_mm"]],
+                        "Root-zone TAW (mm)": [summary["taw_mm"]],
+                        "Management depth (cm)": [summary["management_depth_m"] * 100.0],
+                        "Top 30 cm available water (mm)": [summary["management_taw_mm"]],
+                        "Irrigation trigger deficit (%)": [summary["trigger_depletion_pct"]],
+                        "Irrigation trigger storage (%)": [summary["trigger_storage_pct"]],
+                        "Trigger deficit in top 30 cm (mm)": [summary["trigger_depletion_mm"]],
                         "Total irrigation (mm)": [summary["total_irrigation_mm"]],
                         "Irrigation events (#)": [summary["n_irrigations"]],
                         "Total ETc (mm)": [summary["total_etc_mm"]],
@@ -1297,8 +1408,10 @@ if run_button:
                 show_small_table(summary_table.round(2))
 
                 st.markdown(
-                    """
-                    - **TAW** = Total Available Water in the root zone, based on soil texture and rooting depth.
+                    f"""
+                    - **Root-zone TAW** is retained for seasonal water-balance summaries.
+                    - **Automatic irrigation trigger** is now based on the **top 30 cm management depth**, following the DSSAT-style 50% threshold.
+                    - **Irrigation trigger used:** {summary['trigger_rule']}
                     - Use this tab to compare strategies, irrigation systems, and climate scenarios.
                     """
                 )
@@ -1307,16 +1420,54 @@ if run_button:
             with tabs[2]:
                 st.markdown('<span class="section-header">4. Daily soil water balance and irrigation schedule</span>', unsafe_allow_html=True)
 
-                if irr_df is not None and not irr_df.empty:
-                    st.markdown("##### Irrigation events")
-                    show_small_table(irr_df.round(2))
-                else:
+                if irr_df is None or irr_df.empty:
                     st.info("No irrigation events were triggered in this simulation.")
+                else:
+                    st.success(
+                        f"{len(irr_df)} irrigation events were triggered. "
+                        "The detailed event-date table has been hidden to keep this page clean."
+                    )
 
-                required_ts_cols = ["time", "soil_storage_mm", "deficit_mm"]
+                water_view = st.radio(
+                    "Soil water variable to display",
+                    options=[
+                        "Deficit (% of top 30 cm available water)",
+                        "Soil storage (% of top 30 cm available water)",
+                    ],
+                    index=0,
+                    horizontal=True,
+                    key="soil_water_variable_to_display",
+                    help=(
+                        "Choose one soil-water variable. Both are shown as percent of the "
+                        "maximum available water in the top 30 cm management depth."
+                    ),
+                )
+
+                if water_view.startswith("Deficit"):
+                    water_col = "management_deficit_pct"
+                    water_label = "Soil water deficit (% of top 30 cm available water)"
+                    trigger_label = "50% deficit trigger"
+                    trigger_value = float(summary.get("trigger_depletion_pct", 50.0))
+                    trigger_caption = (
+                        "Irrigation starts only when the deficit reaches the 50% trigger line "
+                        "for the top 30 cm management depth."
+                    )
+                    y_domain = [0, 100]
+                else:
+                    water_col = "management_storage_pct"
+                    water_label = "Soil water storage (% of top 30 cm available water)"
+                    trigger_label = "50% storage trigger"
+                    trigger_value = float(summary.get("trigger_storage_pct", 50.0))
+                    trigger_caption = (
+                        "Irrigation starts only when storage falls to the 50% trigger line "
+                        "for the top 30 cm management depth."
+                    )
+                    y_domain = [0, 100]
+
+                required_ts_cols = ["time", water_col, "irrigation_applied_mm"]
                 missing_ts_cols = [c for c in required_ts_cols if c not in df_weather.columns]
 
-                st.markdown("##### Soil water storage & deficit")
+                st.markdown("##### Irrigation applied and soil water status")
                 if missing_ts_cols or df_weather.empty:
                     st.warning(
                         "Soil water balance columns are unavailable, so the time-series chart was skipped. "
@@ -1324,14 +1475,80 @@ if run_button:
                     )
                 else:
                     ts = df_weather[required_ts_cols].copy()
-                    ts = ts.rename(
-                        columns={
-                            "time": "Date",
-                            "soil_storage_mm": "Soil storage (mm)",
-                            "deficit_mm": "Deficit (mm)",
-                        }
+                    ts["Date"] = pd.to_datetime(ts["time"], errors="coerce")
+                    ts["water_value"] = pd.to_numeric(ts[water_col], errors="coerce").clip(0, 100)
+                    ts["irrigation_applied_mm"] = pd.to_numeric(
+                        ts["irrigation_applied_mm"], errors="coerce"
+                    ).fillna(0.0)
+                    ts["trigger_value"] = trigger_value
+                    ts = ts.dropna(subset=["Date", "water_value"]).copy()
+
+                    water_line = (
+                        alt.Chart(ts)
+                        .mark_line(point=False)
+                        .encode(
+                            x=alt.X("Date:T", title="Date"),
+                            y=alt.Y(
+                                "water_value:Q",
+                                title=water_label,
+                                scale=alt.Scale(domain=y_domain),
+                            ),
+                            tooltip=[
+                                alt.Tooltip("Date:T", title="Date"),
+                                alt.Tooltip("water_value:Q", title=water_label, format=".1f"),
+                            ],
+                        )
                     )
-                    st.line_chart(ts.set_index("Date"))
+
+                    trigger_rule_line = (
+                        alt.Chart(ts)
+                        .mark_rule(strokeDash=[6, 4])
+                        .encode(
+                            y=alt.Y(
+                                "trigger_value:Q",
+                                title=water_label,
+                                scale=alt.Scale(domain=y_domain),
+                            ),
+                            tooltip=[
+                                alt.Tooltip("trigger_value:Q", title=trigger_label, format=".1f"),
+                            ],
+                        )
+                    )
+
+                    irrigation_bars = (
+                        alt.Chart(ts)
+                        .mark_bar(opacity=0.55)
+                        .encode(
+                            x=alt.X("Date:T", title="Date"),
+                            y=alt.Y(
+                                "irrigation_applied_mm:Q",
+                                title="Irrigation applied (mm)",
+                            ),
+                            tooltip=[
+                                alt.Tooltip("Date:T", title="Date"),
+                                alt.Tooltip(
+                                    "irrigation_applied_mm:Q",
+                                    title="Irrigation applied (mm)",
+                                    format=".1f",
+                                ),
+                            ],
+                        )
+                    )
+
+                    # Use two vertically aligned panels instead of a dual-axis layer.
+                    # This avoids the earlier soil-storage display problem and makes
+                    # both deficit and storage options work reliably.
+                    water_chart = alt.layer(water_line, trigger_rule_line).properties(height=300)
+                    irrigation_chart = irrigation_bars.properties(height=120)
+                    chart = alt.vconcat(water_chart, irrigation_chart).resolve_scale(x="shared")
+                    st.altair_chart(chart, use_container_width=True)
+
+                    st.caption(
+                        "The upper panel shows the selected soil-water status as percent of maximum "
+                        "available water in the top 30 cm management depth. The lower panel shows "
+                        "gross irrigation applied in mm. "
+                        f"{trigger_caption}"
+                    )
 
                 st.caption(
                     "Values are conceptual and for demonstration only. For operational scheduling, "
