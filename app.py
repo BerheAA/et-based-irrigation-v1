@@ -664,7 +664,10 @@ def apply_et_method(df_weather, lat, lon, planting_date, season_length, crop_nam
     openet_end = min(season_end, today - timedelta(days=1))
 
     if openet_end < season_start:
-        st.info("OpenET is historical only for this app. Future dates will use Open-Meteo ET0 x Kc.")
+        st.info(
+            "OpenET actual ET is available for past/recent operational dates only. "
+            "Because this selected season is entirely in the future, the app is using Open-Meteo ET0 × Kc forecast."
+        )
         return df
 
     if not get_openet_api_key():
@@ -708,7 +711,10 @@ def apply_et_method(df_weather, lat, lon, planting_date, season_length, crop_nam
         missing_openet = historical_mask & df["openet_actual_et_mm"].isna()
         df.loc[missing_openet, "et_source"] = "Open-Meteo fallback: OpenET missing"
         if season_end >= today:
-            st.info("The selected season includes future dates. Future ET uses Open-Meteo ET0 x Kc because OpenET is historical.")
+            st.info(
+                "OpenET actual ET is used for all available past/recent operational dates. "
+                "Future dates use Open-Meteo ET0 × Kc forecast because OpenET does not provide future ET forecasts."
+            )
 
     elif et_method == "Hybrid: OpenET historical + Open-Meteo forecast":
         df.loc[has_openet, "et_for_irrigation_mm"] = df.loc[has_openet, "openet_actual_et_mm"]
@@ -1077,7 +1083,8 @@ with st.sidebar:
         if et_method != "Open-Meteo ET0 x Kc":
             st.caption(
                 "OpenET requires OPENET_API_KEY in Streamlit secrets. "
-                "Use Hybrid for operational scheduling because OpenET is historical."
+                "Use Hybrid for operational scheduling: OpenET supplies available past/recent actual ET, "
+                "and Open-Meteo ET0 × Kc supplies forecast ET for future dates."
             )
             with st.expander("OpenET advanced settings"):
                 openet_model = st.selectbox(
